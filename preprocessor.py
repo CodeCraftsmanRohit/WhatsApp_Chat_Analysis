@@ -1,61 +1,125 @@
 import re
 import pandas as pd
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
 
 def preprocess(data):
+    """
+    Preprocess WhatsApp chat data
+    """
+    try:
+        # Handle different WhatsApp formats
+        # Common pattern for most WhatsApp exports
+        pattern = r'(\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}\s?[APapMm]*)\s*-\s*(.*)'
 
-    # WhatsApp datetime pattern (Unicode-safe)
-    pattern = r'(\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}[\u202f\s]?(?:AM|PM))\s-\s'
+        lines = data.strip().split('\n')
+        messages = []
+        dates = []
 
-    messages = re.split(pattern, data)[1:]
-    dates = messages[::2]
-    messages = messages[1::2]
+        for line in lines:
+            if not line.strip():
+                continue
 
-    df = pd.DataFrame({
-        'user_message': messages,
-        'message_date': dates
-    })
+            match = re.match(pattern, line)
+            if match:
+                dates.append(match.group(1))
+                messages.append(match.group(2))
+            else:
+                # If line doesn't match pattern, append to last message
+                if messages:
+                    messages[-1] += ' ' + line.strip()
 
-    # clean unicode + dash
-    df['message_date'] = (
-        df['message_date']
-        .str.replace('\u202f', ' ', regex=False)
-        .str.replace(' -', '', regex=False)
-    )
+        if not messages:
+            # Try alternative pattern
+            pattern2 = r'\[(\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}:\d{2})\]\s*(.*)'
+            for line in lines:
+                match = re.match(pattern2, line)
+                if match:
+                    dates.append(match.group(1))
+                    messages.append(match.group(2))
+                elif messages:
+                    messages[-1] += ' ' + line.strip()
 
-    # parse datetime safely
-    df['date'] = pd.to_datetime(df['message_date'], format='mixed', errors='coerce')
-    df.drop(columns=['message_date'], inplace=True)
+        if not messages:
+            raise ValueError("No valid messages found in the file")
 
-    # separate user & message
-    users = []
-    msgs = []
+        # Create DataFrame
+        df = pd.DataFrame({
+            'raw_message': messages,
+            'date_string': dates
+        })
 
-    for message in df['user_message']:
-        entry = re.split(r'^([^:]+):\s', message)
-        if len(entry) > 1:
-            users.append(entry[1])
-            msgs.append(entry[2])
-        else:
-            users.append('group_notification')
-            msgs.append(entry[0])
+        # Clean date strings - FIXED: Use raw string for regex
+        df['date_string'] = df['date_string'].str.replace(r'[\[\]]', '', regex=True)
+        df['date_string'] = df['date_string'].str.replace('\u202f', ' ', regex=False)
 
-    df['user'] = users
-    df['message'] = msgs
-    df.drop(columns=['user_message'], inplace=True)
+        # Parse dates
+        df['date'] = pd.to_datetime(df['date_string'], format='mixed', errors='coerce')
 
-    # datetime features
-    df['only_date'] = df['date'].dt.date
-    df['year'] = df['date'].dt.year
-    df['month_num'] = df['date'].dt.month
-    df['month'] = df['date'].dt.month_name()
-    df['day'] = df['date'].dt.day
-    df['day_name'] = df['date'].dt.day_name()
-    df['hour'] = df['date'].dt.hour
-    df['minute'] = df['date'].dt.minute
+        # Drop rows where date couldn't be parsed
+        df = df.dropna(subset=['date'])
 
-    # period column (hour buckets)
-    df['period'] = df['hour'].apply(
-        lambda x: "23-00" if x == 23 else f"{x:02d}-{x+1:02d}"
-    )
+        # Extract user and message
+        def extract_user_message(text):
+            if not isinstance(text, str):
+                return 'group_notification', ''
 
-    return df
+            # Common patterns
+            if ': ' in text:
+                parts = text.split(': ', 1)
+                if len(parts) == 2:
+                    user = parts[0].strip()
+                    # Clean user name
+                    user = re.sub(r'[\u202c\u200e]', '', user)
+                    message = parts[1].strip()
+                    return user, message
+
+            return 'group_notification', text.strip()
+
+        # Apply extraction
+        extracted = df['raw_message'].apply(extract_user_message)
+        df['user'] = extracted.apply(lambda x: x[0])
+        df['message'] = extracted.apply(lambda x: x[1])
+
+        # Remove rows with empty messages
+        df = df[df['message'].str.strip() != '']
+
+        # Create datetime features
+        df['only_date'] = df['date'].dt.date
+        df['year'] = df['date'].dt.year
+        df['month_num'] = df['date'].dt.month
+        df['month'] = df['date'].dt.month_name()
+        df['day'] = df['date'].dt.day
+        df['day_name'] = df['date'].dt.day_name()
+        df['hour'] = df['date'].dt.hour
+        df['minute'] = df['date'].dt.minute
+
+        # Create time periods
+        def get_period(hour):
+            periods = [
+                (0, 2, "00-02"), (2, 4, "02-04"), (4, 6, "04-06"),
+                (6, 8, "06-08"), (8, 10, "08-10"), (10, 12, "10-12"),
+                (12, 14, "12-14"), (14, 16, "14-16"), (16, 18, "16-18"),
+                (18, 20, "18-20"), (20, 22, "20-22"), (22, 24, "22-24")
+            ]
+            for start, end, label in periods:
+                if start <= hour < end:
+                    return label
+            return "22-24"
+
+        df['period'] = df['hour'].apply(get_period)
+
+        # Drop unnecessary columns
+        df = df.drop(['raw_message', 'date_string'], axis=1)
+
+        # Reset index
+        df = df.reset_index(drop=True)
+
+        return df
+
+    except Exception as e:
+        print(f"Error in preprocessing: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
